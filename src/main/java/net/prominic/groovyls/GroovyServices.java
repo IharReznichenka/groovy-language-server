@@ -45,9 +45,13 @@ import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.control.CompilationFailedException;
 import org.codehaus.groovy.control.ErrorCollector;
 import org.codehaus.groovy.control.Phases;
+import org.codehaus.groovy.control.SourceUnit;
 import org.codehaus.groovy.control.messages.Message;
 import org.codehaus.groovy.control.messages.SyntaxErrorMessage;
 import org.codehaus.groovy.syntax.SyntaxException;
+import net.prominic.groovyls.compiler.control.GroovyLSCompilationUnit;
+import net.prominic.groovyls.compiler.control.io.StringReaderSourceWithURI;
+import net.prominic.groovyls.compiler.ast.ASTNodeVisitor;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionList;
 import org.eclipse.lsp4j.CompletionParams;
@@ -90,8 +94,6 @@ import groovy.lang.GroovyClassLoader;
 import io.github.classgraph.ClassGraph;
 import io.github.classgraph.ClassGraphException;
 import io.github.classgraph.ScanResult;
-import net.prominic.groovyls.compiler.ast.ASTNodeVisitor;
-import net.prominic.groovyls.compiler.control.GroovyLSCompilationUnit;
 import net.prominic.groovyls.config.ICompilationUnitFactory;
 import net.prominic.groovyls.providers.CompletionProvider;
 import net.prominic.groovyls.providers.DefinitionProvider;
@@ -120,6 +122,13 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	private ScanResult classGraphScanResult = null;
 	private GroovyClassLoader classLoader = null;
 	private URI previousContext = null;
+	/**
+	 * Set after the compilation unit has been through a compile. Groovy's
+	 * CompilationUnit phase counter is monotonic, so sources added after that
+	 * first compile are never parsed again; call sites must avoid the
+	 * remove/re-add path once this flag is set.
+	 */
+	private boolean initialCompileDone = false;
 
 	public GroovyServices(ICompilationUnitFactory factory) {
 		compilationUnitFactory = factory;
@@ -438,14 +447,49 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	protected void recompileIfContextChanged(URI newContext) {
-		if (previousContext == null || previousContext.equals(newContext)) {
+		if (previousContext != null && previousContext.equals(newContext)) {
 			return;
+		}
+		if (initialCompileDone && compilationUnit != null) {
+			if (isWorkspaceSourceUnchanged(newContext)) {
+				// Compiled unit + matching contents: never re-add the source
+				// (monotonic phases would leave it unparsed); just make sure
+				// nodes exist for the requested URI.
+				if (astVisitor == null || astVisitor.getNodes(newContext).isEmpty()) {
+					compileSingleFileAndVisit(newContext);
+				}
+				return;
+			}
+			if (!unitHasSource(newContext)) {
+				// not part of the workspace unit; parse standalone
+				compileSingleFileAndVisit(newContext);
+				return;
+			}
+			// workspace source whose tracked contents differ: fall through to
+			// the destructive rebuild below
 		}
 		fileContentsTracker.forceChanged(newContext);
 		compileAndVisitAST(newContext);
 	}
 
 	private void compileAndVisitAST(URI contextURI) {
+		if (initialCompileDone && compilationUnit != null && isWorkspaceSourceUnchanged(contextURI)) {
+			// The unit was already compiled and the on-disk contents match the
+			// tracked buffer. Re-adding the source here would deadlock the
+			// unit (monotonic phases: the re-added source is never parsed
+			// again), so just make sure nodes exist for the requested URI.
+			if (astVisitor == null || astVisitor.getNodes(contextURI).isEmpty()) {
+				compileSingleFileAndVisit(contextURI);
+			}
+			previousContext = contextURI;
+			return;
+		}
+		if (initialCompileDone) {
+			// contents changed on a compiled unit: force a fresh unit so the
+			// changed source is actually parsed again
+			compilationUnitFactory.invalidateCompilationUnit();
+			compilationUnit = null;
+		}
 		Set<URI> uris = Collections.singleton(contextURI);
 		boolean isSameUnit = createOrUpdateCompilationUnit();
 		compile();
@@ -455,6 +499,71 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			visitAST();
 		}
 		previousContext = contextURI;
+	}
+
+	private boolean unitHasSource(URI uri) {
+		Path requestPath;
+		try {
+			requestPath = Paths.get(uri).normalize();
+		} catch (Exception e) {
+			return false;
+		}
+		java.util.Iterator<SourceUnit> it = compilationUnit.iterator();
+		while (it.hasNext()) {
+			try {
+				if (Paths.get(it.next().getSource().getURI()).normalize().equals(requestPath)) {
+					return true;
+				}
+			} catch (Exception ignore) {
+				// malformed source URI; keep scanning
+			}
+		}
+		return false;
+	}
+
+	private boolean isWorkspaceSourceUnchanged(URI uri) {
+		if (!unitHasSource(uri)) {
+			return false;
+		}
+		try {
+			Path path = Paths.get(uri);
+			if (!Files.exists(path)) {
+				return false;
+			}
+			String tracked = fileContentsTracker.getContents(uri);
+			String disk = new String(Files.readAllBytes(path), java.nio.charset.StandardCharsets.UTF_8);
+			return tracked == null || tracked.equals(disk);
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
+	private void compileSingleFileAndVisit(URI uri) {
+		try {
+			Path path = Paths.get(uri);
+			String contents = fileContentsTracker.getContents(uri);
+			if (contents == null) {
+				contents = new String(Files.readAllBytes(path), java.nio.charset.StandardCharsets.UTF_8);
+			}
+			GroovyLSCompilationUnit mini = new GroovyLSCompilationUnit(compilationUnit.getConfiguration(), null,
+					classLoader);
+			SourceUnit sourceUnit = new SourceUnit(path.toString(),
+					new StringReaderSourceWithURI(contents, uri, mini.getConfiguration()), mini.getConfiguration(),
+					mini.getClassLoader(), mini.getErrorCollector());
+			mini.addSource(sourceUnit);
+			try {
+				mini.compile(Phases.CANONICALIZATION);
+			} catch (CompilationFailedException e) {
+				// ignore: visit whatever AST survived, same policy as the main unit
+			}
+			if (astVisitor == null) {
+				visitAST();
+			}
+			mini.iterator().forEachRemaining(astVisitor::visitSourceUnit);
+		} catch (Exception e) {
+			System.err.println("Unexpected exception in language server when compiling single Groovy file.");
+			e.printStackTrace(System.err);
+		}
 	}
 
 	private void compile() {
@@ -474,6 +583,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		} catch (Exception e) {
 			System.err.println("Unexpected exception in language server when compiling Groovy.");
 			e.printStackTrace(System.err);
+		} finally {
+			initialCompileDone = true;
 		}
 		Set<PublishDiagnosticsParams> diagnostics = handleErrorCollector(compilationUnit.getErrorCollector());
 		diagnostics.stream().forEach(languageClient::publishDiagnostics);
