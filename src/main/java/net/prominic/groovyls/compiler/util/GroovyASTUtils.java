@@ -139,10 +139,59 @@ public class GroovyASTUtils {
         if (definitionNode == null) {
             return Collections.emptyList();
         }
+        // Workspace-scale guard: getDefinition per node over the entire AST
+        // (hundreds of thousands of nodes, each resolving against a large
+        // classpath) takes hours. Resolve definitions only for candidates
+        // whose name matches the target.
+        String targetName = definitionName(definitionNode);
         return ast.getNodes().stream().filter(otherNode -> {
+            if (targetName != null && !candidateHasName(otherNode, targetName)) {
+                return false;
+            }
             ASTNode otherDefinition = getDefinition(otherNode, false, ast);
             return definitionNode.equals(otherDefinition) && node.getLineNumber() != -1 && node.getColumnNumber() != -1;
         }).collect(Collectors.toList());
+    }
+
+    private static String definitionName(ASTNode node) {
+        if (node instanceof FieldNode) {
+            return ((FieldNode) node).getName();
+        }
+        if (node instanceof MethodNode) {
+            return ((MethodNode) node).getName();
+        }
+        if (node instanceof PropertyNode) {
+            return ((PropertyNode) node).getName();
+        }
+        if (node instanceof Variable) {
+            return ((Variable) node).getName();
+        }
+        if (node instanceof ClassNode) {
+            return ((ClassNode) node).getNameWithoutPackage();
+        }
+        return null;
+    }
+
+    private static boolean candidateHasName(ASTNode node, String name) {
+        if (node instanceof ConstantExpression) {
+            Object value = ((ConstantExpression) node).getValue();
+            return value instanceof String && name.equals(value);
+        }
+        if (node instanceof VariableExpression) {
+            return name.equals(((VariableExpression) node).getName());
+        }
+        if (node instanceof PropertyExpression) {
+            return name.equals(((PropertyExpression) node).getPropertyAsString());
+        }
+        if (node instanceof ClassExpression) {
+            ClassNode type = ((ClassExpression) node).getType();
+            return type != null && name.equals(type.getNameWithoutPackage());
+        }
+        if (node instanceof ImportNode) {
+            ClassNode type = ((ImportNode) node).getType();
+            return type != null && name.equals(type.getNameWithoutPackage());
+        }
+        return false;
     }
 
     private static ClassNode tryToResolveOriginalClassNode(ClassNode node, boolean strict, ASTNodeVisitor ast) {
